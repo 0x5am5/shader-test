@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { Pane } from 'tweakpane'
 import { halftoneCircleFragmentShader, defaultHalftoneCircleUniforms } from '../shaders/halftoneCircle'
 
@@ -82,10 +82,51 @@ function uploadSource(
 
 /**
  * Full-screen WebGL2 canvas rendering the active shader with a Tweakpane overlay.
- * Drop any image or video into src/assets/media/ to make it selectable.
+ * Drop any image or video onto the canvas, or use the Upload button in the panel.
  */
 export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [isDragging, setIsDragging] = useState(false)
+
+  // Blob URLs created from user uploads — revoked on unmount
+  const blobUrlsRef = useRef<string[]>([])
+  // Queued by file upload; consumed in the render loop (avoids re-running the GL effect)
+  const pendingUploadRef = useRef<{ url: string; videoHint: boolean } | null>(null)
+
+  useEffect(() => {
+    return () => {
+      blobUrlsRef.current.forEach(url => URL.revokeObjectURL(url))
+    }
+  }, [])
+
+  const handleFiles = useCallback((files: FileList | null) => {
+    if (!files || files.length === 0) return
+    const file = Array.from(files).find(f => f.type.startsWith('image/') || f.type.startsWith('video/'))
+    if (!file) return
+    const url = URL.createObjectURL(file)
+    blobUrlsRef.current.push(url)
+    pendingUploadRef.current = { url, videoHint: file.type.startsWith('video/') }
+  }, [])
+
+  // Drag-and-drop on the whole window
+  useEffect(() => {
+    const onDragOver = (e: DragEvent) => { e.preventDefault(); setIsDragging(true) }
+    const onDragLeave = () => setIsDragging(false)
+    const onDrop = (e: DragEvent) => {
+      e.preventDefault()
+      setIsDragging(false)
+      handleFiles(e.dataTransfer?.files ?? null)
+    }
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragleave', onDragLeave)
+    window.addEventListener('drop', onDrop)
+    return () => {
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragleave', onDragLeave)
+      window.removeEventListener('drop', onDrop)
+    }
+  }, [handleFiles])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -124,11 +165,11 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
     // --- Texture state ---
     let currentTexture: WebGLTexture = createGradientTexture(gl)
     let currentVideo: HTMLVideoElement | null = null
-    // URL queued by Tweakpane; consumed at the top of the render loop
     const pendingRef = { url: assets.length > 0 ? assets[0] : null as string | null }
 
-    function loadAsset(url: string) {
-      if (isVideo(url)) {
+    function loadAsset(url: string, videoHint?: boolean) {
+      const treatAsVideo = videoHint !== undefined ? videoHint : isVideo(url)
+      if (treatAsVideo) {
         const vid = document.createElement('video')
         vid.src = url
         vid.loop = true
@@ -153,7 +194,6 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
       }
     }
 
-    // Kick off loading the first asset if available
     if (pendingRef.url) {
       loadAsset(pendingRef.url)
       pendingRef.url = null
@@ -168,7 +208,6 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
     const uSizeByLuma = gl.getUniformLocation(program, 'sizeByLuma')
     const uFixedRadius = gl.getUniformLocation(program, 'fixedRadius')
 
-    // Tweakpane mutates this object directly — no React state needed
     const params: Params = {
       numSquares: defaultHalftoneCircleUniforms.numSquares,
       depth: defaultHalftoneCircleUniforms.depth,
@@ -182,7 +221,6 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
     pane.addBinding(params, 'sizeByLuma', { label: 'Size by Luma' })
     pane.addBinding(params, 'fixedRadius', { label: 'Fixed Radius', min: 0.01, max: 0.5, step: 0.005 })
 
-    // Asset picker — only shown when assets are available
     if (assets.length > 0) {
       const assetOptions = [
         { text: 'Gradient (default)', value: '' },
@@ -210,6 +248,10 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
       })
     }
 
+    pane.addButton({ title: 'Upload File' }).on('click', () => {
+      fileInputRef.current?.click()
+    })
+
     const resize = () => {
       canvas.width = window.innerWidth * devicePixelRatio
       canvas.height = window.innerHeight * devicePixelRatio
@@ -219,13 +261,19 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
 
     let rafId: number
     const render = () => {
-      // Consume pending asset switch
+      // Consume pending asset switch from Tweakpane dropdown
       if (pendingRef.url) {
         loadAsset(pendingRef.url)
         pendingRef.url = null
       }
 
-      // Upload current video frame every tick
+      // Consume pending upload from file input / drag-drop
+      if (pendingUploadRef.current) {
+        const { url, videoHint } = pendingUploadRef.current
+        pendingUploadRef.current = null
+        loadAsset(url, videoHint)
+      }
+
       if (currentVideo && !currentVideo.paused && currentVideo.readyState >= 2) {
         uploadSource(gl, currentTexture, currentVideo)
       }
@@ -269,9 +317,41 @@ export function ShaderCanvas({ assets = [] }: ShaderCanvasProps) {
   }, [assets])
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', display: 'block' }}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', display: 'block' }}
+      />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,video/*"
+        style={{ display: 'none' }}
+        onChange={e => {
+          handleFiles(e.target.files)
+          // Reset so the same file can be re-selected
+          e.target.value = ''
+        }}
+      />
+      {isDragging && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'rgba(0,0,0,0.6)',
+            border: '3px dashed rgba(255,255,255,0.6)',
+            pointerEvents: 'none',
+            zIndex: 100,
+          }}
+        >
+          <p style={{ color: '#fff', fontSize: '1.5rem', fontFamily: 'sans-serif', margin: 0 }}>
+            Drop image or video
+          </p>
+        </div>
+      )}
+    </>
   )
 }
